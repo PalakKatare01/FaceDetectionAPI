@@ -1,0 +1,142 @@
+using OpenCvSharp;
+using FaceDetectionAPI.Models;
+
+namespace FaceDetectionAPI.Services
+{
+    public class FaceDetectionService
+    {
+        private static readonly CascadeClassifier FaceCascade;
+        private static readonly CascadeClassifier EyeCascade;
+        private static readonly CascadeClassifier NoseCascade;
+        private static readonly CascadeClassifier MouthCascade;
+
+        private readonly double _blurThreshold;
+        private readonly double _minFaceCoverage;
+        private readonly int _resizeWidth;
+
+        static FaceDetectionService()
+        {
+            var basePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "haarcascades");
+
+            FaceCascade = new CascadeClassifier(Path.Combine(basePath, "haarcascade_frontalface_default.xml"));
+            EyeCascade = new CascadeClassifier(Path.Combine(basePath, "haarcascade_eye.xml"));
+            NoseCascade = new CascadeClassifier(Path.Combine(basePath, "haarcascade_mcs_nose.xml"));
+            MouthCascade = new CascadeClassifier(Path.Combine(basePath, "haarcascade_mcs_mouth.xml"));
+        }
+
+        public FaceDetectionService(IConfiguration config)
+        {
+            _blurThreshold = config.GetValue<double>("FaceDetection:BlurThreshold");
+            _minFaceCoverage = config.GetValue<double>("FaceDetection:MinFaceCoverage");
+            _resizeWidth = config.GetValue<int>("FaceDetection:ResizeWidth");
+        }
+
+        public FaceDetectionResult Validate(byte[] imageBytes)
+        {
+            var result = new FaceDetectionResult();
+
+            using var mat = Mat.FromImageData(imageBytes, ImreadModes.Color);
+            if (mat.Empty())
+            {
+                result.Success = false;
+                result.Message = "Invalid image format.";
+                return result;
+            }
+
+            // Resize for performance
+            if (mat.Width > _resizeWidth)
+            {
+                double scale = (double)_resizeWidth / mat.Width;
+                Cv2.Resize(mat, mat, new Size(), scale, scale);
+            }
+
+            using var gray = new Mat();
+            Cv2.CvtColor(mat, gray, ColorConversionCodes.BGR2GRAY);
+            Cv2.EqualizeHist(gray, gray);
+
+            // Blur detection
+            using var laplacian = new Mat();
+            Cv2.Laplacian(gray, laplacian, MatType.CV_64F);
+            var blurValue = Cv2.Mean(Cv2.Abs(laplacian))[0];
+            result.BlurValue = blurValue;
+            if (blurValue < _blurThreshold)
+            {
+                result.Success = false;
+                result.Message = $"Image is too blurry (variance={blurValue:F2}).";
+                return result;
+            }
+
+            // Detect faces
+            var faces = FaceCascade.DetectMultiScale(gray, 1.1, 5, HaarDetectionTypes.ScaleImage, new Size(30, 30));
+            result.FacesDetected = faces.Length;
+
+            if (faces.Length == 0)
+            {
+                result.Success = false;
+                result.Message = "No face detected.";
+                return result;
+            }
+            if (faces.Length > 1)
+            {
+                result.Success = false;
+                result.Message = "Multiple faces detected. Please upload a single face image.";
+                return result;
+            }
+
+            var face = faces[0];
+
+            // Face coverage check
+            double coverage = (face.Width * face.Height) / (double)(mat.Width * mat.Height);
+            result.FaceCoverage = coverage;
+            if (coverage < _minFaceCoverage)
+            {
+                result.Success = false;
+                result.Message = $"Face is too small (coverage={coverage:P0}).";
+                return result;
+            }
+
+            // Subregion checks
+            var faceROI = new Mat(gray, face);
+
+            var eyes = EyeCascade.DetectMultiScale(faceROI, 1.1, 5, HaarDetectionTypes.ScaleImage, new Size(15, 15));
+            var nose = NoseCascade.DetectMultiScale(faceROI, 1.1, 5);
+            var mouth = MouthCascade.DetectMultiScale(faceROI, 1.1, 5);
+
+            if (eyes.Length < 1)
+            {
+                result.Success = false;
+                result.Message = "No eyes detected.";
+                return result;
+            }
+            if (nose.Length < 1)
+            {
+                result.Success = false;
+                result.Message = "No nose detected.";
+                return result;
+            }
+            if (mouth.Length < 1)
+            {
+                result.Success = false;
+                result.Message = "No mouth detected.";
+                return result;
+            }
+
+            // Draw annotations for debugging
+            Cv2.Rectangle(mat, face, Scalar.Green, 2);
+            foreach (var e in eyes) Cv2.Rectangle(mat, new Rect(face.X + e.X, face.Y + e.Y, e.Width, e.Height), Scalar.Blue, 2);
+            foreach (var n in nose) Cv2.Rectangle(mat, new Rect(face.X + n.X, face.Y + n.Y, n.Width, n.Height), Scalar.Red, 2);
+            foreach (var m in mouth) Cv2.Rectangle(mat, new Rect(face.X + m.X, face.Y + m.Y, m.Width, m.Height), Scalar.Yellow, 2);
+
+            string outDir = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", "outputs");
+            Directory.CreateDirectory(outDir);
+            string fileName = $"face_{Guid.NewGuid()}.jpg";
+            string filePath = Path.Combine(outDir, fileName);
+            Cv2.ImWrite(filePath, mat);
+            result.AnnotatedImagePath = $"/outputs/{fileName}";
+
+            result.Success = true;
+            result.Message = "Valid human face detected.";
+            return result;
+        }
+    }
+}
